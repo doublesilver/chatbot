@@ -1,65 +1,72 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
-import json
+import time
 
 app = FastAPI()
 
-# MongoDB 연결 (환경변수 MONGO_URL 사용)
 MONGO_URL = os.getenv("MONGO_URL")
 client = AsyncIOMotorClient(MONGO_URL)
-db = client['channeltalk_db']
-messages_collection = db['messages']
+db = client.channeltalk_db
+messages_collection = db.messages
+conversations_collection = db.conversations
+
 
 @app.post("/webhook")
-async def webhook_handler(request: Request):
-    data = await request.json()
-    print(json.dumps(data, indent=2, ensure_ascii=False))  # 수신 데이터 로그 출력
+async def webhook_handler(req: Request):
+    try:
+        data = await req.json()
+        entity = data.get("entity", {})
+        refers = data.get("refers", {})
+        person_type = entity.get("personType")  # user, manager, bot 등
 
-    person_type = data.get("entity", {}).get("personType")
-    
-    # 문의하는 고객 메시지 처리
-    if person_type == "user":
-        question = data.get("refers", {}).get("message", {}).get("plainText") \
-                   or data.get("refers", {}).get("message", {}).get("blocks", [{}])[0].get("value")
-        store_name = data.get("refers", {}).get("user", {}).get("name") \
-                     or data.get("entity", {}).get("name")
-        tags = data.get("entity", {}).get("tags") \
-               or data.get("refers", {}).get("userChat", {}).get("tags", [])
-        
-        document = {
-            "type": "question",
-            "content": question,
-            "store_name": store_name,
+        # bot인 경우 무시
+        if person_type == "bot":
+            return {"status": "ignored - bot message"}
+
+        chat_id = entity.get("chatId") or entity.get("mainKey")
+        plain_text = entity.get("plainText", "")
+        tags = entity.get("tags", [])
+        state = entity.get("state", "").lower()
+        created_at = entity.get("createdAt", int(time.time() * 1000))
+
+        answerer_name = refers.get("manager", {}).get("name") if person_type == "manager" else None
+
+        store_name = entity.get("name") or "알수없음"
+
+        message_doc = {
+            "chatId": chat_id,
+            "type": "answer" if person_type == "manager" else "question",
+            "content": plain_text,
+            "personType": person_type,
+            "senderName": answerer_name,
+            "createdAt": created_at,
             "tags": tags,
-            "created_at": data.get("entity", {}).get("createdAt")
+            "storeName": store_name,
         }
-        await messages_collection.insert_one(document)
 
-    # 상담사가 답변하는 메시지 처리
-    elif person_type == "manager":
-        answer = data.get("entity", {}).get("plainText") \
-                 or data.get("entity", {}).get("blocks", [{}])[0].get("value")
-        answerer = data.get("refers", {}).get("manager", {})
-        store_name = data.get("refers", {}).get("user", {}).get("name") \
-                     or data.get("entity", {}).get("name")
-        tags = data.get("refers", {}).get("userChat", {}).get("tags", [])
-        
-        document = {
-            "type": "answer",
-            "content": answer,
-            "answerer_name": answerer.get("name"),
-            "store_name": store_name,
-            "tags": tags,
-            "created_at": data.get("entity", {}).get("createdAt")
-        }
-        await messages_collection.insert_one(document)
+        await messages_collection.insert_one(message_doc)
 
-    else:
-        # personType이 user, manager 외일 경우(필요시 로그 또는 처리)
-        print(f"Unhandled personType: {person_type}")
+        if state == "closed":
+            conv_update = {
+                "chatId": chat_id,
+                "storeName": store_name,
+                "finalTags": tags,
+                "state": "closed",
+                "closedAt": created_at,
+                "updatedAt": int(time.time() * 1000),
+            }
+            await conversations_collection.update_one(
+                {"chatId": chat_id},
+                {"$set": conv_update},
+                upsert=True,
+            )
 
-    return {"status": "saved"}
+        return {"status": "success"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/")
 async def root():
